@@ -165,7 +165,8 @@ final class FileText implements Closeable {
         for (int i = 0; i < raw.length(); i++) {
             int next = raw.charAt(i) == '\t' ? (c / TAB_SIZE + 1) * TAB_SIZE : c + 1;
             if (col < next) {
-                return col == c ? i : (col - c < next - col ? i : i + 1);
+                boolean closerToStart = col - c < next - col;
+                return closerToStart ? i : i + 1;
             }
             c = next;
         }

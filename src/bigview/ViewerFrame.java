@@ -22,6 +22,7 @@ import javax.swing.TransferHandler;
 import javax.swing.border.EmptyBorder;
 import javax.swing.event.AncestorEvent;
 import javax.swing.event.AncestorListener;
+import java.awt.Adjustable;
 import java.awt.BorderLayout;
 import java.awt.FileDialog;
 import java.awt.GridLayout;
@@ -29,6 +30,7 @@ import java.awt.Toolkit;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.ActionEvent;
+import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -44,10 +46,11 @@ import java.util.List;
 final class ViewerFrame extends JFrame {
 
     private static final int CTRL = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
+    private static final String STATUS_GAP = "     ";
 
     private final TextView view = new TextView();
-    private final JScrollBar vbar = new JScrollBar(JScrollBar.VERTICAL);
-    private final JScrollBar hbar = new JScrollBar(JScrollBar.HORIZONTAL);
+    private final JScrollBar vbar = new JScrollBar(Adjustable.VERTICAL);
+    private final JScrollBar hbar = new JScrollBar(Adjustable.HORIZONTAL);
     private final JLabel statusLeft = new JLabel(" ");
     private final JLabel statusRight = new JLabel(" ");
 
@@ -136,7 +139,7 @@ final class ViewerFrame extends JFrame {
         file.add(item("Open...", KeyEvent.VK_O, CTRL, this::chooseFile));
         file.add(item("Reload", KeyEvent.VK_F5, 0, this::reload));
         file.addSeparator();
-        file.add(item("Exit", KeyEvent.VK_F4, KeyEvent.ALT_DOWN_MASK, this::dispose));
+        file.add(item("Exit", KeyEvent.VK_F4, InputEvent.ALT_DOWN_MASK, this::dispose));
         bar.add(file);
 
         JMenu edit = new JMenu("Edit");
@@ -312,10 +315,12 @@ final class ViewerFrame extends JFrame {
 
             @Override
             public void ancestorRemoved(AncestorEvent e) {
+                // only the initial focus matters
             }
 
             @Override
             public void ancestorMoved(AncestorEvent e) {
+                // only the initial focus matters
             }
         });
         JCheckBox matchCase = new JCheckBox("Match case", lastMatchCase);
@@ -358,27 +363,7 @@ final class ViewerFrame extends JFrame {
         updateStatus();
         Thread worker = new Thread(() -> {
             try {
-                Searcher s = new Searcher(t.channel, t.size(), pattern, matchCase, () -> searchCancel,
-                        done -> searchPercent = (int) (done * 100 / Math.max(1, t.size())));
-                long hit = s.findNext(from);
-                if (searchCancel) {
-                    return;
-                }
-                if (hit < 0) {
-                    SwingUtilities.invokeLater(() -> error("Cannot find \"" + query + "\"."));
-                    return;
-                }
-                while (!t.index.isDone() && t.index.scannedBytes() <= hit && !searchCancel) {
-                    Thread.sleep(20);
-                }
-                FileText.Position pos = t.locate(hit, pattern.length);
-                SwingUtilities.invokeLater(() -> {
-                    if (text == t && !searchCancel) {
-                        lastMatchOffset = hit;
-                        view.showMatch(pos);
-                        notice = hit < from ? "Search wrapped to the beginning of the file." : null;
-                    }
-                });
+                search(t, pattern, matchCase, from, query);
             } catch (IOException | UncheckedIOException e) {
                 SwingUtilities.invokeLater(() -> error("Search failed: " + e.getMessage()));
             } catch (InterruptedException e) {
@@ -392,6 +377,33 @@ final class ViewerFrame extends JFrame {
         }, "search");
         worker.setDaemon(true);
         worker.start();
+    }
+
+    /** Runs on the search thread; shows the result on the event thread. */
+    private void search(FileText t, byte[] pattern, boolean matchCase, long from, String query)
+            throws IOException, InterruptedException {
+        Searcher s = new Searcher(t.channel, t.size(), pattern, matchCase, () -> searchCancel,
+                done -> searchPercent = (int) (done * 100 / Math.max(1, t.size())));
+        long hit = s.findNext(from);
+        if (searchCancel) {
+            return;
+        }
+        if (hit < 0) {
+            SwingUtilities.invokeLater(() -> error("Cannot find \"" + query + "\"."));
+            return;
+        }
+        // The line number of the hit is only known once the indexer has passed it.
+        while (!t.index.isDone() && t.index.scannedBytes() <= hit && !searchCancel) {
+            Thread.sleep(20);
+        }
+        FileText.Position pos = t.locate(hit, pattern.length);
+        SwingUtilities.invokeLater(() -> {
+            if (text == t && !searchCancel) {
+                lastMatchOffset = hit;
+                view.showMatch(pos);
+                notice = hit < from ? "Search wrapped to the beginning of the file." : null;
+            }
+        });
     }
 
     private void cancelSearch() {
@@ -459,19 +471,23 @@ final class ViewerFrame extends JFrame {
         StringBuilder sb = new StringBuilder();
         TextView.Pos caret = view.caret();
         if (caret != null) {
-            sb.append("Ln ").append(Format.number(caret.line() + 1)).append(", Col ")
-                    .append(caret.col() == Integer.MAX_VALUE ? "end" : Integer.toString(caret.col() + 1)).append("     ");
+            String col = caret.col() == Integer.MAX_VALUE ? "end" : Integer.toString(caret.col() + 1);
+            sb.append("Ln ").append(Format.number(caret.line() + 1)).append(", Col ").append(col).append(STATUS_GAP);
         }
-        sb.append(Format.number(view.lineCount())).append(" lines");
-        LineIndex idx = text.index;
-        if (idx.error() != null) {
-            sb.append(" (index error: ").append(idx.error().getMessage()).append(')');
-        } else if (!idx.isDone()) {
-            sb.append(" (indexing ").append(idx.scannedBytes() * 100 / Math.max(1, idx.fileSize)).append("%)");
-        }
-        sb.append("     ").append(Format.bytes(text.size()));
-        sb.append("     ").append(text.charset().displayName());
+        sb.append(Format.number(view.lineCount())).append(" lines").append(indexState(text.index));
+        sb.append(STATUS_GAP).append(Format.bytes(text.size()));
+        sb.append(STATUS_GAP).append(text.charset().displayName());
         statusRight.setText(sb.toString());
+    }
+
+    private static String indexState(LineIndex idx) {
+        if (idx.error() != null) {
+            return " (index error: " + idx.error().getMessage() + ")";
+        }
+        if (!idx.isDone()) {
+            return " (indexing " + idx.scannedBytes() * 100 / Math.max(1, idx.fileSize) + "%)";
+        }
+        return "";
     }
 
     private void error(String message) {

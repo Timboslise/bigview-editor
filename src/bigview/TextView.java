@@ -17,6 +17,7 @@ import java.awt.Toolkit;
 import java.awt.event.ActionEvent;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
+import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
@@ -36,6 +37,12 @@ final class TextView extends JComponent {
         }
     }
 
+    private record Selection(Pos start, Pos end) {
+        boolean coversLine(long line) {
+            return line >= start.line() && line <= end.line();
+        }
+    }
+
     static final long MAX_COPY_BYTES = 50L * 1024 * 1024;
 
     private static final Color BG = Color.WHITE;
@@ -52,9 +59,9 @@ final class TextView extends JComponent {
     private int leftCol;
     private Pos anchor;
     private Pos caret;
-    private FileText.Position match;
+    private FileText.Position searchMatch;
 
-    private Font font;
+    private Font textFont;
     private int charW;
     private int lineH;
     private int ascent;
@@ -105,7 +112,7 @@ final class TextView extends JComponent {
         topLine = 0;
         leftCol = 0;
         anchor = caret = null;
-        match = null;
+        searchMatch = null;
         invalidateCache();
         changed();
     }
@@ -167,7 +174,7 @@ final class TextView extends JComponent {
     // ---- scrolling ------------------------------------------------------------------------
 
     void setTopLine(long line) {
-        long t = Math.max(0, Math.min(line, maxTop()));
+        long t = Math.clamp(line, 0L, maxTop());
         if (t != topLine) {
             topLine = t;
             repaint();
@@ -180,7 +187,7 @@ final class TextView extends JComponent {
     }
 
     void setLeftCol(int col) {
-        int c = Math.max(0, Math.min(col, maxCols()));
+        int c = Math.clamp(col, 0, maxCols());
         if (c != leftCol) {
             leftCol = c;
             repaint();
@@ -190,14 +197,14 @@ final class TextView extends JComponent {
 
     /** Scrolls so that {@code line} is in the middle of the screen and marks it as the current line. */
     void goToLine(long line) {
-        long l = Math.max(0, Math.min(line, lastLine()));
+        long l = Math.clamp(line, 0L, lastLine());
         caret = anchor = new Pos(l, 0);
         setLeftCol(0);
         setTopLine(l - rows() / 2);
     }
 
     void showMatch(FileText.Position p) {
-        match = p;
+        searchMatch = p;
         FileText.Line line = lineAt(p.line());
         int start = FileText.displayCol(line.raw(), p.rawStart());
         int end = FileText.displayCol(line.raw(), p.rawEnd());
@@ -220,8 +227,8 @@ final class TextView extends JComponent {
     }
 
     void setFontSize(int size) {
-        font = new Font(FONT_FAMILY, Font.PLAIN, Math.max(6, Math.min(72, size)));
-        FontMetrics fm = getFontMetrics(font);
+        textFont = new Font(FONT_FAMILY, Font.PLAIN, Math.clamp(size, 6, 72));
+        FontMetrics fm = getFontMetrics(textFont);
         charW = Math.max(1, fm.charWidth('m'));
         lineH = fm.getHeight();
         ascent = fm.getAscent();
@@ -231,7 +238,7 @@ final class TextView extends JComponent {
     }
 
     int fontSize() {
-        return font.getSize();
+        return textFont.getSize();
     }
 
     // ---- selection ------------------------------------------------------------------------
@@ -248,15 +255,14 @@ final class TextView extends JComponent {
 
     /** The exact original text of the selection, or null if nothing is selected. */
     String selectedText() {
-        if (text == null || anchor == null || caret == null || anchor.equals(caret)) {
+        Selection sel = selection();
+        if (text == null || sel == null) {
             return null;
         }
-        Pos s = anchor.compareTo(caret) <= 0 ? anchor : caret;
-        Pos e = s == anchor ? caret : anchor;
-        FileText.Line ls = lineAt(s.line());
-        FileText.Line le = lineAt(e.line());
-        long from = text.byteOffset(ls, FileText.rawIndex(ls.raw(), s.col()));
-        long to = text.byteOffset(le, FileText.rawIndex(le.raw(), e.col()));
+        FileText.Line ls = lineAt(sel.start().line());
+        FileText.Line le = lineAt(sel.end().line());
+        long from = text.byteOffset(ls, FileText.rawIndex(ls.raw(), sel.start().col()));
+        long to = text.byteOffset(le, FileText.rawIndex(le.raw(), sel.end().col()));
         if (to - from > MAX_COPY_BYTES) {
             throw new IllegalStateException("The selection is too large to copy ("
                     + Format.bytes(to - from) + "; the limit is " + Format.bytes(MAX_COPY_BYTES) + ").");
@@ -273,17 +279,18 @@ final class TextView extends JComponent {
         return s != null && s.length() <= 200 ? s : null;
     }
 
+    /** The selection with start before end, or null when nothing is selected. */
+    private Selection selection() {
+        if (anchor == null || caret == null || anchor.equals(caret)) {
+            return null;
+        }
+        return anchor.compareTo(caret) < 0 ? new Selection(anchor, caret) : new Selection(caret, anchor);
+    }
+
     private Pos clampToLine(Pos p) {
         FileText.Line line = lineAt(p.line());
         int len = line == null ? 0 : FileText.expandTabs(line.raw()).length();
-        return new Pos(p.line(), Math.max(0, Math.min(p.col(), len)));
-    }
-
-    private Pos posAt(Point pt) {
-        long line = topLine + Math.floorDiv(pt.y, lineH);
-        line = Math.max(0, Math.min(line, lastLine()));
-        int col = leftCol + (int) Math.round((pt.x - textX()) / (double) charW);
-        return clampToLine(new Pos(line, Math.max(0, col)));
+        return new Pos(p.line(), Math.clamp(p.col(), 0, len));
     }
 
     // ---- reading --------------------------------------------------------------------------
@@ -322,64 +329,22 @@ final class TextView extends JComponent {
         } else {
             g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
         }
-        int w = getWidth();
-        int h = getHeight();
         g.setColor(BG);
-        g.fillRect(0, 0, w, h);
-        g.setFont(font);
+        g.fillRect(0, 0, getWidth(), getHeight());
+        g.setFont(textFont);
         if (text == null) {
             g.setColor(GUTTER_FG);
             g.drawString("Open a file with Ctrl+O, or drop it here.", charW * 2, lineH * 2);
             return;
         }
-
-        List<FileText.Line> lines = visibleLines();
-        int gutter = gutterWidth();
-        int tx = textX();
-        int cols = visibleCols() + 1;
         g.setColor(GUTTER_BG);
-        g.fillRect(0, 0, gutter, h);
+        g.fillRect(0, 0, gutterWidth(), getHeight());
 
-        Pos selStart = null;
-        Pos selEnd = null;
-        if (anchor != null && caret != null && !anchor.equals(caret)) {
-            selStart = anchor.compareTo(caret) <= 0 ? anchor : caret;
-            selEnd = selStart == anchor ? caret : anchor;
-        }
-
+        Selection selection = selection();
+        List<FileText.Line> lines = visibleLines();
         int longest = 0;
         for (int i = 0; i < lines.size(); i++) {
-            FileText.Line line = lines.get(i);
-            int y = i * lineH;
-            String display = line.display();
-            longest = Math.max(longest, display.length());
-
-            if (caret != null && selStart == null && caret.line() == line.number()) {
-                g.setColor(CURRENT_LINE);
-                g.fillRect(gutter, y, w - gutter, lineH);
-            }
-            if (selStart != null && line.number() >= selStart.line() && line.number() <= selEnd.line()) {
-                int a = line.number() == selStart.line() ? selStart.col() : 0;
-                int b = line.number() == selEnd.line() ? Math.min(selEnd.col(), display.length()) : display.length() + 1;
-                fillCols(g, SELECTION, tx, y, a, b);
-            }
-            if (match != null && match.line() == line.number()) {
-                fillCols(g, MATCH, tx, y, FileText.displayCol(line.raw(), match.rawStart()),
-                        Math.max(FileText.displayCol(line.raw(), match.rawEnd()),
-                                FileText.displayCol(line.raw(), match.rawStart()) + 1));
-            }
-
-            g.setColor(GUTTER_FG);
-            String num = Long.toString(line.number() + 1);
-            g.drawString(num, gutter - charW - num.length() * charW, y + ascent);
-
-            if (leftCol < display.length()) {
-                String visible = display.substring(leftCol, Math.min(display.length(), leftCol + cols));
-                g.setColor(FG);
-                Graphics2D clip = (Graphics2D) g.create(gutter, 0, w - gutter, h);
-                clip.drawString(visible, tx - gutter, y + ascent);
-                clip.dispose();
-            }
+            longest = Math.max(longest, paintLine(g, lines.get(i), i * lineH, selection));
         }
         if (longest > longestVisible) {
             longestVisible = longest;
@@ -387,12 +352,49 @@ final class TextView extends JComponent {
         }
     }
 
-    private void fillCols(Graphics2D g, Color c, int tx, int y, int fromCol, int toCol) {
+    /** Paints one row and returns its display length. */
+    private int paintLine(Graphics2D g, FileText.Line line, int y, Selection selection) {
+        String display = line.display();
+        long n = line.number();
+        int gutter = gutterWidth();
+
+        if (selection == null && caret != null && caret.line() == n) {
+            g.setColor(CURRENT_LINE);
+            g.fillRect(gutter, y, getWidth() - gutter, lineH);
+        }
+        if (selection != null && selection.coversLine(n)) {
+            int from = n == selection.start().line() ? selection.start().col() : 0;
+            int to = n == selection.end().line()
+                    ? Math.min(selection.end().col(), display.length())
+                    : display.length() + 1;
+            fillCols(g, SELECTION, y, from, to);
+        }
+        if (searchMatch != null && searchMatch.line() == n) {
+            int from = FileText.displayCol(line.raw(), searchMatch.rawStart());
+            int to = FileText.displayCol(line.raw(), searchMatch.rawEnd());
+            fillCols(g, MATCH, y, from, Math.max(to, from + 1));
+        }
+
+        g.setColor(GUTTER_FG);
+        String num = Long.toString(n + 1);
+        g.drawString(num, gutter - charW - num.length() * charW, y + ascent);
+
+        if (leftCol < display.length()) {
+            String visible = display.substring(leftCol, Math.min(display.length(), leftCol + visibleCols() + 1));
+            g.setColor(FG);
+            Graphics2D clip = (Graphics2D) g.create(gutter, 0, getWidth() - gutter, getHeight());
+            clip.drawString(visible, textX() - gutter, y + ascent);
+            clip.dispose();
+        }
+        return display.length();
+    }
+
+    private void fillCols(Graphics2D g, Color c, int y, int fromCol, int toCol) {
         int a = Math.max(fromCol, leftCol);
         int b = Math.min(toCol, leftCol + visibleCols() + 1);
         if (b > a) {
             g.setColor(c);
-            g.fillRect(tx + (a - leftCol) * charW, y, (b - a) * charW, lineH);
+            g.fillRect(textX() + (a - leftCol) * charW, y, (b - a) * charW, lineH);
         }
     }
 
@@ -408,8 +410,8 @@ final class TextView extends JComponent {
         bind(im, KeyEvent.VK_DOWN, 0, "down", () -> scrollLines(1));
         bind(im, KeyEvent.VK_PAGE_UP, 0, "pageUp", () -> scrollLines(-(rows() - 1)));
         bind(im, KeyEvent.VK_PAGE_DOWN, 0, "pageDown", () -> scrollLines(rows() - 1));
-        bind(im, KeyEvent.VK_HOME, KeyEvent.CTRL_DOWN_MASK, "top", () -> setTopLine(0));
-        bind(im, KeyEvent.VK_END, KeyEvent.CTRL_DOWN_MASK, "bottom", () -> setTopLine(Long.MAX_VALUE));
+        bind(im, KeyEvent.VK_HOME, InputEvent.CTRL_DOWN_MASK, "top", () -> setTopLine(0));
+        bind(im, KeyEvent.VK_END, InputEvent.CTRL_DOWN_MASK, "bottom", () -> setTopLine(Long.MAX_VALUE));
         bind(im, KeyEvent.VK_LEFT, 0, "left", () -> setLeftCol(leftCol - 4));
         bind(im, KeyEvent.VK_RIGHT, 0, "right", () -> setLeftCol(leftCol + 4));
         bind(im, KeyEvent.VK_HOME, 0, "lineStart", () -> setLeftCol(0));
@@ -466,7 +468,7 @@ final class TextView extends JComponent {
                 return;
             }
             caret = posAt(e.getPoint());
-            autoScrollDir = e.getY() < 0 ? -1 : e.getY() >= getHeight() ? 1 : 0;
+            autoScrollDir = autoScrollDirection(e.getY());
             if (autoScrollDir != 0) {
                 autoScroll.start();
             } else {
@@ -479,6 +481,20 @@ final class TextView extends JComponent {
         @Override
         public void mouseReleased(MouseEvent e) {
             autoScroll.stop();
+        }
+
+        private Pos posAt(Point pt) {
+            long line = Math.clamp(topLine + Math.floorDiv(pt.y, lineH), 0L, lastLine());
+            int col = leftCol + (int) Math.round((pt.x - textX()) / (double) charW);
+            return clampToLine(new Pos(line, Math.max(0, col)));
+        }
+
+        /** -1 above the view, 1 below it, 0 inside. */
+        private int autoScrollDirection(int y) {
+            if (y < 0) {
+                return -1;
+            }
+            return y >= getHeight() ? 1 : 0;
         }
     }
 

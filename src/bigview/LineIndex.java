@@ -23,6 +23,12 @@ final class LineIndex {
     final long fileSize;
     private final FileChannel channel;
 
+    /*
+     * Single writer, many readers. The writer stores an element (copying into a new array
+     * first when growing) and only then publishes it by writing checkpointCount. Readers read
+     * checkpointCount first and then the array, so every index below the count is visible:
+     * a later grown array is a copy that contains it as well. AtomicLongArray cannot grow.
+     */
     private volatile long[] checkpoints = new long[1024];
     private volatile int checkpointCount;
     private volatile long lineCount = 1;
