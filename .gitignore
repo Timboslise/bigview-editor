@@ -1,0 +1,8 @@
+# build output (recreate with build.ps1)
+out/
+dist/
+
+# IntelliJ per-user files
+.idea/workspace.xml
+.idea/usage.statistics.xml
+.idea/shelf/
